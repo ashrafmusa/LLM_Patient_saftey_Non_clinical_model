@@ -1,0 +1,46 @@
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+usage_log.txt
+
+# Streamlit and tooling artifacts
+.streamlit/
+.qodo/
+
+# Generated output files
+template_*.docx
+checklist_*.txt
+letter_to_editor.docx
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# LLM repo publication/manuscript assets (keep local, do not push)
+LLM/patient_safety_llm/tools/publication/
+LLM/patient_safety_llm/docs/figures/
+LLM/patient_safety_llm/artifacts/publication/
+LLM/patient_safety_llm/reports/
+
+# Legacy manuscript app files not part of LLM study repo
+_archive/
+manuscript_tools.py
+manuscript_app_unified.py
+tests/test_manuscript_tools.py
+
+# Keep legacy root project files local-only after LLM-only migration
+/README.md
+/app.py
+/journals_db.py
+/manuscript_tools.py
+/requirements.txt
+
+# Keep other non-target LLM root folders/files out of this repo scope
+LLM/llama.cpp/
+LLM/docs/
+LLM/reports/
+LLM/Patient_Safety_LLM_Manuscript_IJQHC.docx
+LLM/aug_temp_scenarios.csv
+LLM/temp_scenarios.csv

@@ -1,0 +1,16 @@
+.venv/
+.venv311/
+__pycache__/
+models/
+data/
+artifacts/
+.env
+.coverage
+src/plots.py
+
+# Keep manuscript/revision artifacts out of code repository
+SINGLE_AUTHOR_VERIFICATION.md
+SUBMISSION_READINESS_VERIFICATION.md
+docs/Patient_Safety_LLM_Manuscript.pdf
+docs/study_draft.md
+docs/archive/editorial_revision_2026/
