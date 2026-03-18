@@ -176,6 +176,15 @@ Local llama.cpp server setup:
 set LLAMA_SERVER_URL=http://127.0.0.1:8080
 ```
 
+Retrieval and audit setup:
+
+```bash
+set RETRIEVAL_ENABLED=true
+set RETRIEVAL_DOCS_DIR=docs
+set RETRIEVAL_MAX_CHUNKS=3
+set AUDIT_LOG_DIR=reports/audit_logs
+```
+
 Custom model serving setup:
 
 ```bash
@@ -230,18 +239,43 @@ Response shape:
 {
   "risk_level": "high",
   "details": {
-    "input_text": "...",
-    "llm": {
-      "text": "..."
+    "input_text": "Medication error: ordered 10mg warfarin instead of 1mg. Patient found unresponsive.",
+    "retrieval": {
+      "context": "Source: aim1_real_llm_plan.md\n...",
+      "sources": [
+        {
+          "path": ".../docs/aim1_real_llm_plan.md",
+          "score": 0.67,
+          "excerpt": "..."
+        }
+      ],
+      "retrieval_enabled": true
     },
-    "assessment": {
+    "llm_assessment": {
+      "risk_level": "high",
+      "event_type": "medication",
+      "care_setting": "unknown",
+      "action_urgency": "emergent",
+      "needs_escalation": true,
+      "uncertainty_flag": false,
+      "guardrail_triggered": true,
+      "guardrail_reasons": ["high_harm_signal", "dose_mismatch"]
+    },
+    "baseline_assessment": {
       "risk_level": "high",
       "score": 0.91,
       "model_based": true
+    },
+    "audit": {
+      "audit_id": "...",
+      "audit_log_path": ".../reports/audit_logs/assess_log.jsonl"
     }
   }
 }
 ```
+
+Audit output:
+- `reports/audit_logs/assess_log.jsonl`
 
 ### `POST /predict`
 
@@ -381,11 +415,11 @@ This project is research and prototyping code. It is not a certified medical dev
 Known limitations:
 - primary included dataset is small and synthetic
 - no clinician-adjudicated gold-standard incident set is included in the repository
-- no RAG-backed citation or standards retrieval is implemented yet
-- current retrieval is lexical and local-document based, not vector-search backed
-- no persistent audit log or model-governance registry exists yet
+- retrieval is lexical and local-document based, not vector-search backed
+- retrieval does not yet provide standards-grade inline citations or ranking by clinical authority
+- audit logging exists, but there is no governance dashboard, review queue, or model registry yet
 - APIs do not currently include authentication, authorization, or rate limiting
-- the minimal `/assess` API uses LLM output as upstream text input to the classical risk path, which is useful for experimentation but should be reviewed carefully before production use
+- `/assess` combines retrieval, LLM assessment, guardrails, and a baseline model in one response, which is useful for experimentation but should be separated into clearer service boundaries before production use
 
 ## Recommended Next Steps
 
