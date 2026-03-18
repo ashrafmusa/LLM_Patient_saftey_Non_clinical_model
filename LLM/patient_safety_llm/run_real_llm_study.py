@@ -143,8 +143,8 @@ def main() -> int:
     parser.add_argument(
         "--strategies",
         nargs="+",
-        default=["zero_shot", "few_shot", "chain_of_thought"],
-        choices=["zero_shot", "few_shot", "chain_of_thought"],
+        default=["zero_shot", "few_shot", "chain_of_thought", "safety_focused"],
+        choices=["zero_shot", "few_shot", "chain_of_thought", "safety_focused"],
         help="Prompting strategies to evaluate",
     )
     args = parser.parse_args()

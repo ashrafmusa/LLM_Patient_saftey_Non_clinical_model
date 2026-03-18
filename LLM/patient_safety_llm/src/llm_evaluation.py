@@ -20,6 +20,8 @@ import re
 from typing import Dict, List, Optional
 
 from .llm_interface import generate_response
+from .retrieval import retrieve_relevant_context
+from .safety_guardrails import apply_output_guardrails, detect_input_risks
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,30 @@ Clinical scenario:
 
 Respond with ONLY a JSON object in the format:
 {{"risk_level": "<low|medium|high>", "reasoning": "<brief explanation>"}}"""
+
+SAFETY_FOCUSED_PROMPT = """You are a patient safety reviewer for healthcare AI triage support.
+
+Read the clinical scenario and return ONLY a JSON object with these fields:
+- risk_level: one of low, medium, high
+- event_type: one of medication, allergy, deterioration, diagnosis, communication, documentation, fall, mental_health, other
+- care_setting: one of outpatient, emergency, inpatient, unknown
+- action_urgency: one of routine, urgent, emergent
+- needs_escalation: true or false
+- uncertainty_flag: true or false
+- reasoning: brief clinical safety explanation
+
+Classification rules:
+- Use high when there is severe or immediate risk of harm.
+- Use medium when harm is plausible and needs active follow-up.
+- Use low when no immediate safety threat is present.
+- Set needs_escalation=true when clinician review or urgent workflow escalation is warranted.
+- Set uncertainty_flag=true when the scenario lacks enough information for a confident classification.
+
+Clinical scenario:
+{scenario}
+Relevant safety context:
+{context}
+"""
 
 FEW_SHOT_PROMPT = """You are a clinical safety analyst. Classify each clinical scenario into a patient safety risk level: low, medium, or high.
 
@@ -70,7 +96,62 @@ def _parse_llm_risk_response(response_text: str) -> Dict:
     Attempts JSON parsing first, then falls back to keyword extraction.
     """
     if not response_text:
-        return {"risk_level": None, "reasoning": "No response", "parse_method": "empty"}
+        return {
+            "risk_level": None,
+            "reasoning": "No response",
+            "parse_method": "empty",
+            "event_type": "other",
+            "care_setting": "unknown",
+            "action_urgency": "routine",
+            "needs_escalation": False,
+            "uncertainty_flag": True,
+        }
+
+    def _normalize_bool(value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "1"}:
+                return True
+            if lowered in {"false", "no", "0"}:
+                return False
+        return default
+
+    def _infer_event_type(text: str) -> str:
+        lowered_text = text.lower()
+        keyword_map = {
+            "medication": ["medication", "dose", "dosing", "warfarin", "insulin", "drug", "prescribed"],
+            "allergy": ["allergy", "allergic", "anaphylaxis", "rash", "reaction"],
+            "deterioration": ["unresponsive", "sepsis", "respiratory", "hemorrhage", "arrest", "deterioration"],
+            "diagnosis": ["misdiagnosis", "diagnosis", "missed", "delayed diagnosis"],
+            "communication": ["handoff", "communication", "miscommunicated", "not informed"],
+            "documentation": ["documentation", "chart", "record", "mrn", "note"],
+            "fall": ["fall", "fell"],
+            "mental_health": ["suicide", "self-harm", "overdose intent", "psychiatric"],
+        }
+        for event_type, keywords in keyword_map.items():
+            if any(keyword in lowered_text for keyword in keywords):
+                return event_type
+        return "other"
+
+    def _infer_care_setting(text: str) -> str:
+        lowered_text = text.lower()
+        if any(token in lowered_text for token in ["er", "emergency", "ed"]):
+            return "emergency"
+        if any(token in lowered_text for token in ["ward", "inpatient", "icu", "admitted", "hospital"]):
+            return "inpatient"
+        if any(token in lowered_text for token in ["clinic", "follow-up", "outpatient", "office", "annual physical"]):
+            return "outpatient"
+        return "unknown"
+
+    def _infer_urgency(level: str | None, text: str) -> str:
+        lowered_text = text.lower()
+        if level == "high" or any(token in lowered_text for token in ["immediate", "unresponsive", "arrest", "anaphylaxis"]):
+            return "emergent"
+        if level == "medium" or any(token in lowered_text for token in ["monitor", "review", "follow up", "reassess"]):
+            return "urgent"
+        return "routine"
 
     # Try JSON extraction
     try:
@@ -84,6 +165,11 @@ def _parse_llm_risk_response(response_text: str) -> Dict:
                     "risk_level": level,
                     "reasoning": data.get("reasoning", ""),
                     "parse_method": "json",
+                    "event_type": data.get("event_type") or _infer_event_type(response_text),
+                    "care_setting": data.get("care_setting") or _infer_care_setting(response_text),
+                    "action_urgency": data.get("action_urgency") or _infer_urgency(level, response_text),
+                    "needs_escalation": _normalize_bool(data.get("needs_escalation"), default=(level == "high")),
+                    "uncertainty_flag": _normalize_bool(data.get("uncertainty_flag"), default=False),
                 }
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -96,9 +182,23 @@ def _parse_llm_risk_response(response_text: str) -> Dict:
                 "risk_level": level,
                 "reasoning": response_text[:200],
                 "parse_method": "keyword",
+                "event_type": _infer_event_type(response_text),
+                "care_setting": _infer_care_setting(response_text),
+                "action_urgency": _infer_urgency(level, response_text),
+                "needs_escalation": level == "high",
+                "uncertainty_flag": False,
             }
 
-    return {"risk_level": None, "reasoning": response_text[:200], "parse_method": "failed"}
+    return {
+        "risk_level": None,
+        "reasoning": response_text[:200],
+        "parse_method": "failed",
+        "event_type": _infer_event_type(response_text),
+        "care_setting": _infer_care_setting(response_text),
+        "action_urgency": "routine",
+        "needs_escalation": False,
+        "uncertainty_flag": True,
+    }
 
 
 def classify_with_llm(
@@ -112,7 +212,7 @@ def classify_with_llm(
     scenario : str
         Clinical scenario text.
     strategy : str
-        One of 'zero_shot', 'few_shot', 'chain_of_thought'.
+        One of 'zero_shot', 'few_shot', 'chain_of_thought', 'safety_focused'.
 
     Returns
     -------
@@ -120,30 +220,69 @@ def classify_with_llm(
     """
     templates = {
         "zero_shot": ZERO_SHOT_PROMPT,
+        "safety_focused": SAFETY_FOCUSED_PROMPT,
         "few_shot": FEW_SHOT_PROMPT,
         "chain_of_thought": CHAIN_OF_THOUGHT_PROMPT,
     }
     template = templates.get(strategy, ZERO_SHOT_PROMPT)
-    prompt = template.format(scenario=scenario)
+    retrieval = {"context": "", "sources": [], "retrieval_enabled": False}
+    if strategy == "safety_focused":
+        retrieval = retrieve_relevant_context(scenario)
+
+    prompt = template.format(
+        scenario=scenario,
+        context=retrieval.get("context") or "No external context available.",
+    )
+
+    input_risk = detect_input_risks(scenario)
+    if input_risk["input_blocked"]:
+        return {
+            "risk_level": None,
+            "reasoning": "Input blocked by policy guardrails.",
+            "strategy": strategy,
+            "raw_response": "",
+            "parse_method": "blocked",
+            "event_type": "other",
+            "care_setting": "unknown",
+            "action_urgency": "routine",
+            "needs_escalation": False,
+            "uncertainty_flag": True,
+            "guardrail_triggered": True,
+            "guardrail_reasons": input_risk["input_risk_reasons"],
+            "guardrail_override": "input_blocked",
+            "retrieved_context": retrieval.get("context", ""),
+            "retrieval_sources": retrieval.get("sources", []),
+        }
 
     try:
         response = generate_response(prompt)
         raw_text = response.get("text", "")
         parsed = _parse_llm_risk_response(raw_text)
-        return {
+        result = {
             **parsed,
             "strategy": strategy,
             "raw_response": raw_text[:500],
+            "retrieved_context": retrieval.get("context", ""),
+            "retrieval_sources": retrieval.get("sources", []),
         }
+        return apply_output_guardrails(scenario, result)
     except Exception as e:
         logger.warning("LLM classification failed for strategy '%s': %s", strategy, e)
-        return {
+        result = {
             "risk_level": None,
             "reasoning": str(e),
             "strategy": strategy,
             "raw_response": "",
             "parse_method": "error",
+            "event_type": "other",
+            "care_setting": "unknown",
+            "action_urgency": "routine",
+            "needs_escalation": False,
+            "uncertainty_flag": True,
+            "retrieved_context": retrieval.get("context", ""),
+            "retrieval_sources": retrieval.get("sources", []),
         }
+        return apply_output_guardrails(scenario, result)
 
 
 # ── Simulated LLM evaluation (for reproducible demonstration) ──────────────
@@ -188,6 +327,7 @@ def _simulate_llm_response(scenario: str, strategy: str, seed: int = 42) -> Dict
         "zero_shot": 0.58,
         "few_shot": 0.72,
         "chain_of_thought": 0.68,
+        "safety_focused": 0.76,
     }
     base_accuracy = accuracy_by_strategy.get(strategy, 0.58)
 
@@ -206,14 +346,20 @@ def _simulate_llm_response(scenario: str, strategy: str, seed: int = 42) -> Dict
     # Simulate occasional parse failures (2% for zero-shot, 1% for others)
     fail_rate = 0.02 if strategy == "zero_shot" else 0.01
     if rng.random() < fail_rate:
-        return {
+        result = {
             "risk_level": None,
             "reasoning": "The model refused to classify or gave ambiguous output.",
             "strategy": strategy,
             "raw_response": "I cannot determine the risk level without additional context.",
             "parse_method": "failed",
+            "event_type": _infer_simulated_event_type(lowered),
+            "care_setting": _infer_simulated_care_setting(lowered),
+            "action_urgency": "routine",
+            "needs_escalation": False,
+            "uncertainty_flag": True,
             "simulated": True,
         }
+        return apply_output_guardrails(scenario, result)
 
     reasoning_templates = {
         "low": "The scenario describes a routine clinical encounter with no safety concerns identified.",
@@ -221,14 +367,44 @@ def _simulate_llm_response(scenario: str, strategy: str, seed: int = 42) -> Dict
         "high": "The scenario involves serious patient safety concerns requiring immediate attention.",
     }
 
-    return {
+    result = {
         "risk_level": predicted,
         "reasoning": reasoning_templates.get(predicted, ""),
         "strategy": strategy,
         "raw_response": json.dumps({"risk_level": predicted, "reasoning": reasoning_templates.get(predicted, "")}),
         "parse_method": "json",
+        "event_type": _infer_simulated_event_type(lowered),
+        "care_setting": _infer_simulated_care_setting(lowered),
+        "action_urgency": "emergent" if predicted == "high" else "urgent" if predicted == "medium" else "routine",
+        "needs_escalation": predicted == "high",
+        "uncertainty_flag": False,
         "simulated": True,
     }
+    return apply_output_guardrails(scenario, result)
+
+
+def _infer_simulated_event_type(lowered: str) -> str:
+    if any(term in lowered for term in ["medication", "dose", "warfarin", "antihypertensive"]):
+        return "medication"
+    if any(term in lowered for term in ["allergy", "allergic", "anaphylaxis", "rash"]):
+        return "allergy"
+    if any(term in lowered for term in ["fall", "fell"]):
+        return "fall"
+    if any(term in lowered for term in ["suicide", "self-harm"]):
+        return "mental_health"
+    if any(term in lowered for term in ["unresponsive", "sepsis", "respiratory", "cardiac arrest"]):
+        return "deterioration"
+    return "other"
+
+
+def _infer_simulated_care_setting(lowered: str) -> str:
+    if any(term in lowered for term in ["emergency", "ed", "er"]):
+        return "emergency"
+    if any(term in lowered for term in ["ward", "icu", "inpatient", "hospital"]):
+        return "inpatient"
+    if any(term in lowered for term in ["clinic", "follow-up", "routine", "annual physical"]):
+        return "outpatient"
+    return "unknown"
 
 
 def evaluate_llm_on_scenarios(
@@ -252,7 +428,7 @@ def evaluate_llm_on_scenarios(
     dict with keys: results (list), summary (dict per strategy)
     """
     if strategies is None:
-        strategies = ["zero_shot", "few_shot", "chain_of_thought"]
+        strategies = ["zero_shot", "few_shot", "chain_of_thought", "safety_focused"]
 
     all_results = []
 
@@ -315,6 +491,9 @@ def evaluate_llm_on_scenarios(
             "per_class": per_class,
             "confusion": confusion,
             "conservative_bias": _compute_conservative_bias(strategy_results),
+            "escalation_rate": _compute_escalation_rate(strategy_results),
+            "uncertainty_rate": _compute_uncertainty_rate(strategy_results),
+            "guardrail_trigger_rate": _compute_guardrail_trigger_rate(strategy_results),
         }
 
     return {"results": all_results, "summary": summary}
@@ -327,6 +506,25 @@ def _compute_conservative_bias(results: List[Dict]) -> float:
         return 0.0
     over_predicted = sum(1 for r in non_high if r.get("risk_level") == "high")
     return over_predicted / len(non_high)
+
+
+def _compute_escalation_rate(results: List[Dict]) -> float:
+    valid = [r for r in results if r.get("risk_level") is not None]
+    if not valid:
+        return 0.0
+    return sum(1 for r in valid if r.get("needs_escalation")) / len(valid)
+
+
+def _compute_uncertainty_rate(results: List[Dict]) -> float:
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r.get("uncertainty_flag")) / len(results)
+
+
+def _compute_guardrail_trigger_rate(results: List[Dict]) -> float:
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r.get("guardrail_triggered")) / len(results)
 
 
 def compare_tfidf_vs_llm(

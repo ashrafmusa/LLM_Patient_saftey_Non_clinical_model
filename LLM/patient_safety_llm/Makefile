@@ -54,3 +54,4 @@ eval:
 
 serve:
 	uvicorn src.serve_custom_llm_api:app --host 0.0.0.0 --port 8010
+
